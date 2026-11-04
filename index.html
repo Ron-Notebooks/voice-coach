@@ -1,56 +1,239 @@
-import numpy as np, sounddevice as sd, json, os, time, csv
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Coach</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --muted:#999; --green:#22c55e; --red:#ef4444; --idle:#333; --btn:#2563eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,sans-serif;
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px 16px; text-align:center; }
+  h1 { font-size:1.5rem; margin:0 0 8px; }
+  p { color:var(--muted); max-width:420px; line-height:1.4; }
+  button { background:var(--btn); color:#fff; border:0; border-radius:12px; font-size:1.1rem;
+           padding:14px 24px; margin:8px; min-width:220px; cursor:pointer; }
+  button.secondary { background:#444; }
+  button:disabled { opacity:.5; }
+  #light { width:min(70vw,280px); height:min(70vw,280px); border-radius:50%; background:var(--idle);
+           display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:700;
+           margin:24px auto; transition:background .15s; }
+  #light.green { background:var(--green); }
+  #light.red { background:var(--red); }
+  #reading { font-size:1.2rem; margin:4px 0; }
+  #stats { color:var(--muted); margin:8px 0 16px; }
+  #countdown { font-size:3rem; font-weight:700; margin:16px 0; }
+  .hidden { display:none !important; }
+  .screen { display:flex; flex-direction:column; align-items:center; width:100%; }
+  #error { color:var(--red); max-width:420px; }
+</style>
+</head>
+<body>
+<h1>Voice Coach</h1>
+<div id="error"></div>
 
-SR = 16000
-CHUNK = 0.5
-CAL = "loud_cal.json"
+<!-- Start screen -->
+<div id="startScreen" class="screen">
+  <p id="savedInfo"></p>
+  <button id="btnPractice" class="hidden">Start practising</button>
+  <button id="btnCalibrate">Calibrate</button>
+</div>
 
-def record(sec):
-    a = sd.rec(int(sec*SR), samplerate=SR, channels=1, dtype="float64")
-    sd.wait()
-    return a[:, 0]
+<!-- Calibration screen -->
+<div id="calScreen" class="screen hidden">
+  <p id="calText"></p>
+  <div id="countdown"></div>
+  <button id="btnCalStep">Start</button>
+</div>
 
-def db(x):
-    return 20*np.log10(np.sqrt(np.mean(x**2)) + 1e-9)
+<!-- Practice screen -->
+<div id="practiceScreen" class="screen hidden">
+  <div id="light">…</div>
+  <div id="reading">Start talking</div>
+  <div id="stats"></div>
+  <button id="btnStop">Stop</button>
+</div>
 
-def chunks(x):
-    n = int(CHUNK*SR)
-    return [db(x[i:i+n]) for i in range(0, len(x)-n+1, n)]
+<!-- Summary screen -->
+<div id="summaryScreen" class="screen hidden">
+  <p id="summaryText"></p>
+  <button id="btnDownload">Download session (CSV)</button>
+  <button id="btnAgain">Practise again</button>
+  <button id="btnHome" class="secondary">Back</button>
+</div>
 
-def calibrate():
-    input("Press Enter, then stay SILENT for 3 seconds...")
-    noise = np.median(chunks(record(3)))
-    input("Press Enter, then talk for 15 seconds in your TARGET voice...")
-    voice = [d for d in chunks(record(15)) if d > noise + 6]
-    target = float(np.percentile(voice, 25)) - 2
-    cal = {"noise": float(noise), "target": target}
-    json.dump(cal, open(CAL, "w"), indent=2)
-    print(f"Room noise {noise:.0f} dB, target {target:.0f} dB")
-    return cal
+<script>
+const CHUNK = 0.5;              // seconds per measurement, same as the Python script
+const KEY = "loud_cal";
+let ctx = null, stream = null, proc = null, onChunk = null;
+let sumSq = 0, count = 0, chunkLen = 0;
+let cal = null, log = [];
 
-def live(cal):
-    print("\nListening. Ctrl+C to stop.\n")
-    log = []
-    gate = cal["noise"] + 6
-    try:
-        while True:
-            d = db(record(CHUNK))
-            if d < gate:
-                continue
-            hit = d >= cal["target"]
-            mark = "\033[92m●  GREEN\033[0m" if hit else "\033[91m●  RED - project\033[0m"
-            print(f"{mark}   {d:.0f} dB (target {cal['target']:.0f})")
-            log.append({"t": time.time(), "db": d, "hit": hit})
-    except KeyboardInterrupt:
-        pass
-    if log:
-        pct = 100*np.mean([r["hit"] for r in log])
-        print(f"\nSession: {len(log)*CHUNK:.0f} seconds of voice, {pct:.0f}% on target.")
-        name = time.strftime("loud_%Y%m%d_%H%M.csv")
-        with open(name, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=log[0].keys())
-            w.writeheader(); w.writerows(log)
-        print("Saved", name)
+const $ = id => document.getElementById(id);
+function show(id) {
+  ["startScreen","calScreen","practiceScreen","summaryScreen"].forEach(s => $(s).classList.toggle("hidden", s !== id));
+}
+function err(msg) { $("error").textContent = msg || ""; }
 
-if __name__ == "__main__":
-    use = os.path.exists(CAL) and input("Use saved calibration? y/n ") == "y"
-    live(json.load(open(CAL)) if use else calibrate())
+function loadCal() { try { return JSON.parse(localStorage.getItem(KEY)); } catch (e) { return null; } }
+function saveCal(c) { try { localStorage.setItem(KEY, JSON.stringify(c)); } catch (e) {} }
+
+function home() {
+  cal = loadCal();
+  if (cal) {
+    $("savedInfo").textContent = `Saved calibration: room ${cal.noise.toFixed(0)} dB, target ${cal.target.toFixed(0)} dB.`;
+    $("btnPractice").classList.remove("hidden");
+    $("btnCalibrate").textContent = "Recalibrate";
+  } else {
+    $("savedInfo").textContent = "First, calibrate: 3 seconds of silence, then 15 seconds in your target voice.";
+    $("btnPractice").classList.add("hidden");
+    $("btnCalibrate").textContent = "Calibrate";
+  }
+  show("startScreen");
+}
+
+// Microphone with automatic volume levelling turned off
+async function startMic() {
+  if (ctx) return;
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { autoGainControl: false, noiseSuppression: false, echoCancellation: false }
+  });
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  const src = ctx.createMediaStreamSource(stream);
+  proc = ctx.createScriptProcessor(2048, 1, 1);
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  chunkLen = Math.round(ctx.sampleRate * CHUNK);
+  proc.onaudioprocess = e => {
+    const x = e.inputBuffer.getChannelData(0);
+    for (let i = 0; i < x.length; i++) {
+      sumSq += x[i] * x[i]; count++;
+      if (count >= chunkLen) {
+        const d = 20 * Math.log10(Math.sqrt(sumSq / count) + 1e-9);
+        sumSq = 0; count = 0;
+        if (onChunk) onChunk(d);
+      }
+    }
+  };
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+}
+
+function stopMic() {
+  onChunk = null;
+  if (proc) proc.disconnect();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  ctx = stream = proc = null; sumSq = 0; count = 0;
+}
+
+function collect(seconds) {
+  return new Promise(resolve => {
+    const vals = [], need = Math.round(seconds / CHUNK);
+    sumSq = 0; count = 0;
+    onChunk = d => {
+      vals.push(d);
+      $("countdown").textContent = Math.max(0, Math.ceil(seconds - vals.length * CHUNK));
+      if (vals.length >= need) { onChunk = null; resolve(vals); }
+    };
+  });
+}
+
+function percentile(arr, p) {
+  const s = [...arr].sort((a, b) => a - b), i = (p / 100) * (s.length - 1);
+  const lo = Math.floor(i), hi = Math.ceil(i);
+  return s[lo] + (s[hi] - s[lo]) * (i - lo);
+}
+
+// Calibration
+let calStep = 0, noise = 0;
+function startCalibration() {
+  err(""); calStep = 0;
+  $("calText").textContent = "Step 1 of 2: press Start, then stay SILENT for 3 seconds.";
+  $("countdown").textContent = "";
+  $("btnCalStep").disabled = false;
+  show("calScreen");
+}
+
+async function calNext() {
+  $("btnCalStep").disabled = true;
+  try {
+    await startMic();
+    if (calStep === 0) {
+      $("calText").textContent = "Stay silent…";
+      noise = percentile(await collect(3), 50);
+      calStep = 1;
+      $("calText").textContent = "Step 2 of 2: press Start, then talk for 15 seconds in your TARGET voice.";
+      $("countdown").textContent = "";
+      $("btnCalStep").disabled = false;
+    } else {
+      $("calText").textContent = "Keep talking in your target voice…";
+      const voice = (await collect(15)).filter(d => d > noise + 6);
+      stopMic();
+      if (voice.length < 4) {
+        err("Couldn't hear enough voice. Try again, a bit closer to the phone.");
+        startCalibration();
+        return;
+      }
+      cal = { noise: noise, target: percentile(voice, 25) - 2 };
+      saveCal(cal);
+      $("countdown").textContent = "";
+      home();
+    }
+  } catch (e) {
+    stopMic();
+    err("Microphone not available. Allow microphone access and try again.");
+    home();
+  }
+}
+
+// Practice
+async function startPractice() {
+  err(""); cal = loadCal(); if (!cal) return startCalibration();
+  log = [];
+  $("light").className = ""; $("light").textContent = "…";
+  $("reading").textContent = "Start talking";
+  $("stats").textContent = "";
+  show("practiceScreen");
+  try { await startMic(); } catch (e) { err("Microphone not available. Allow microphone access and try again."); return home(); }
+  const gate = cal.noise + 6;
+  onChunk = d => {
+    if (d < gate) return;                 // silence: keep last colour
+    const hit = d >= cal.target;
+    $("light").className = hit ? "green" : "red";
+    $("light").textContent = hit ? "GOOD" : "LOUDER";
+    $("reading").textContent = `${d.toFixed(0)} dB (target ${cal.target.toFixed(0)})`;
+    log.push({ t: Date.now() / 1000, db: d, hit: hit });
+    const pct = 100 * log.filter(r => r.hit).length / log.length;
+    $("stats").textContent = `${(log.length * CHUNK).toFixed(0)} s of voice · ${pct.toFixed(0)}% on target`;
+  };
+}
+
+function stopPractice() {
+  stopMic();
+  if (!log.length) return home();
+  const pct = 100 * log.filter(r => r.hit).length / log.length;
+  $("summaryText").textContent = `Session: ${(log.length * CHUNK).toFixed(0)} seconds of voice, ${pct.toFixed(0)}% on target.`;
+  show("summaryScreen");
+}
+
+function downloadCsv() {
+  const rows = ["t,db,hit"].concat(log.map(r => `${r.t.toFixed(2)},${r.db.toFixed(1)},${r.hit}`));
+  const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `loud_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}.csv`;
+  a.click();
+}
+
+$("btnCalibrate").onclick = startCalibration;
+$("btnCalStep").onclick = calNext;
+$("btnPractice").onclick = startPractice;
+$("btnStop").onclick = stopPractice;
+$("btnAgain").onclick = startPractice;
+$("btnHome").onclick = home;
+$("btnDownload").onclick = downloadCsv;
+home();
+</script>
+</body>
+</html>
