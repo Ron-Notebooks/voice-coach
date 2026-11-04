@@ -1,1 +1,56 @@
-<!DOCTYPE html>
+import numpy as np, sounddevice as sd, json, os, time, csv
+
+SR = 16000
+CHUNK = 0.5
+CAL = "loud_cal.json"
+
+def record(sec):
+    a = sd.rec(int(sec*SR), samplerate=SR, channels=1, dtype="float64")
+    sd.wait()
+    return a[:, 0]
+
+def db(x):
+    return 20*np.log10(np.sqrt(np.mean(x**2)) + 1e-9)
+
+def chunks(x):
+    n = int(CHUNK*SR)
+    return [db(x[i:i+n]) for i in range(0, len(x)-n+1, n)]
+
+def calibrate():
+    input("Press Enter, then stay SILENT for 3 seconds...")
+    noise = np.median(chunks(record(3)))
+    input("Press Enter, then talk for 15 seconds in your TARGET voice...")
+    voice = [d for d in chunks(record(15)) if d > noise + 6]
+    target = float(np.percentile(voice, 25)) - 2
+    cal = {"noise": float(noise), "target": target}
+    json.dump(cal, open(CAL, "w"), indent=2)
+    print(f"Room noise {noise:.0f} dB, target {target:.0f} dB")
+    return cal
+
+def live(cal):
+    print("\nListening. Ctrl+C to stop.\n")
+    log = []
+    gate = cal["noise"] + 6
+    try:
+        while True:
+            d = db(record(CHUNK))
+            if d < gate:
+                continue
+            hit = d >= cal["target"]
+            mark = "\033[92m●  GREEN\033[0m" if hit else "\033[91m●  RED - project\033[0m"
+            print(f"{mark}   {d:.0f} dB (target {cal['target']:.0f})")
+            log.append({"t": time.time(), "db": d, "hit": hit})
+    except KeyboardInterrupt:
+        pass
+    if log:
+        pct = 100*np.mean([r["hit"] for r in log])
+        print(f"\nSession: {len(log)*CHUNK:.0f} seconds of voice, {pct:.0f}% on target.")
+        name = time.strftime("loud_%Y%m%d_%H%M.csv")
+        with open(name, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=log[0].keys())
+            w.writeheader(); w.writerows(log)
+        print("Saved", name)
+
+if __name__ == "__main__":
+    use = os.path.exists(CAL) and input("Use saved calibration? y/n ") == "y"
+    live(json.load(open(CAL)) if use else calibrate())
